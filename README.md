@@ -16,7 +16,7 @@ SAGE MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s toolin
 pip install fastmcp openai
 ```
 
-Clone or copy `utility/mcp_tool_helper.py` into your project.
+Clone or copy `mcp_tool_helper.py` into your project.
 
 ## Quick Start
 
