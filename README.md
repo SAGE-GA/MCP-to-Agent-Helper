@@ -25,8 +25,8 @@ from utility.mcp_tool_helper import MCPToolkit, UserContext
 
 # Launch a local MCP server via stdio
 toolkit = MCPToolkit(
-    server_cmd="../SAGE-H5P-Activity-Generator/.venv/bin/python",
-    server_script="../SAGE-H5P-Activity-Generator/mcp_tools.py",
+    server_cmd="../FastMCP_Server/.venv/bin/python",
+    server_script="../FastMCP_Server/mcp_tools.py",
     server_args=("--option",),
 )
 
