@@ -1,6 +1,6 @@
-# SAGE MCP Tool Helper
+# MCP Tool Helper
 
-SAGE MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s tooling ecosystem with OpenAI's Agent Framework. It discovers tools exposed by an MCP server, wraps them as OpenAI `FunctionTool`s, and forwards FastMCP progress and log events so agent UIs can show real-time status updates. This fills the gap in the Agent Framework, which does not natively stream tool status back to the client.
+MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s tooling ecosystem with OpenAI's Agent Framework. It discovers tools exposed by an MCP server, wraps them as OpenAI `FunctionTools`, and forwards FastMCP progress and log events so agent UIs can show real-time status updates. This fills the gap in the Agent Framework, which does not natively stream tool status back to the client.
 
 ## Features
 
