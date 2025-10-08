@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-import sys
+import os
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from agents.exceptions import ModelBehaviorError
 from agents.tool import FunctionTool
@@ -28,14 +30,56 @@ class UserContext:
     emit_log: Optional[Callable[[str, str, Any], None]] = None
 
 
+def _coerce_env_names(
+    names: str | Sequence[str] | None,
+) -> tuple[str, ...]:
+    if names is None:
+        return ()
+    if isinstance(names, str):
+        return (names,)
+    return tuple(name for name in names if name)
+
+
+def _first_env_value(names: tuple[str, ...]) -> str | None:
+    for name in names:
+        if not name:
+            continue
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class MCPClientConfig:
-    server_cmd: str | None
-    server_script: Path | None
+    base_url: str
+    sse_path: str
+    auth_token_env: tuple[str, ...] = ()
+    connection_retries: int = 5
+    retry_interval: float = 0.5
+    headers: tuple[tuple[str, str], ...] = ()
+    server_cmd: str | None = None
+    server_script: Path | None = None
     server_args: tuple[str, ...] = ()
 
+    def build_headers(
+        self,
+        overrides: Optional[Mapping[str, str]] = None,
+    ) -> dict[str, str]:
+        headers = {name: value for name, value in self.headers}
+        for name in self.auth_token_env:
+            token = os.getenv(name)
+            if token:
+                headers.setdefault("Authorization", f"Bearer {token}")
+                break
+        if overrides:
+            headers.update(overrides)
+        return headers
 
-TransportFactory = Callable[[MCPClientConfig], ClientTransport]
+
+TransportFactory = Callable[
+    [MCPClientConfig, Optional[Mapping[str, str]]], ClientTransport
+]
 
 
 @dataclass
@@ -73,6 +117,28 @@ def emit_log(tool_name: str, level: str, data: Any) -> None:
     _stdout_emit_log(tool_name, level, data)
 
 
+def _merge_headers(
+    *sources: Optional[Mapping[str, str]]
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for source in sources:
+        if source:
+            merged.update(source)
+    return merged
+
+
+def _normalize_path(path: str) -> str:
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if not path.endswith("/"):
+        path = f"{path}/"
+    return path
+
+
+def _build_sse_url(config: MCPClientConfig) -> str:
+    return config.base_url.rstrip("/") + config.sse_path
+
+
 def _normalize_args(config: MCPClientConfig) -> tuple[str, ...]:
     if not config.server_args:
         return ()
@@ -90,40 +156,90 @@ def _normalize_args(config: MCPClientConfig) -> tuple[str, ...]:
     return tuple(filtered)
 
 
-def _build_stdio_transport(config: MCPClientConfig) -> PythonStdioTransport:
-    if config.server_script is None:
-        raise ValueError("server_script must be provided for stdio transport")
-    if config.server_cmd is None:
-        raise ValueError("server_cmd must be provided for stdio transport")
+def _build_default_transport(
+    config: MCPClientConfig, headers: Optional[Mapping[str, str]]
+) -> ClientTransport:
+    if config.server_script is not None:
+        if config.server_cmd is None:
+            raise ValueError(
+                "server_cmd must be provided when using stdio transport."
+            )
+        return PythonStdioTransport(
+            config.server_script,
+            python_cmd=config.server_cmd,
+            args=list(_normalize_args(config)),
+        )
 
-    return PythonStdioTransport(
-        config.server_script,
-        python_cmd=config.server_cmd,
-        args=list(_normalize_args(config)),
+    header_dict = _merge_headers(headers)
+    return SSETransport(
+        url=_build_sse_url(config),
+        headers=header_dict or None,
     )
 
 
 def _transport_factory_from_spec(transport_spec: Any) -> TransportFactory:
-    def _factory(_: MCPClientConfig) -> ClientTransport:
+    def _factory(
+        config: MCPClientConfig, headers: Optional[Mapping[str, str]]
+    ) -> ClientTransport:
         if isinstance(transport_spec, ClientTransport):
             return transport_spec
-        return infer_transport(transport_spec)
+
+        transport = infer_transport(transport_spec)
+        if headers:
+            header_dict = _merge_headers(headers)
+            if isinstance(transport, SSETransport):
+                transport.headers = header_dict
+            elif isinstance(transport, StreamableHttpTransport):
+                transport.headers = header_dict
+            else:
+                raise ValueError(
+                    "Cannot merge headers into inferred transport. "
+                    "Provide a transport_factory instead."
+                )
+        return transport
 
     return _factory
+
+
+def _normalize_transport_factory(
+    factory: Callable[..., ClientTransport] | None,
+) -> TransportFactory:
+    if factory is None:
+        return _build_default_transport
+
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None and len(signature.parameters) == 1:
+
+        def _wrapped(
+            config: MCPClientConfig, headers: Optional[Mapping[str, str]]
+        ) -> ClientTransport:
+            return factory(config)  # type: ignore[arg-type]
+
+        return _wrapped
+
+    return factory  # type: ignore[return-value]
 
 
 def build_streamable_http_transport_factory(
     *,
     url: str,
-    headers: Optional[dict[str, str]] = None,
+    headers: Optional[Mapping[str, str]] = None,
     auth: Any = None,
     sse_read_timeout: Any = None,
     httpx_client_factory: Optional[Callable[[], Any]] = None,
 ) -> TransportFactory:
-    def _factory(_: MCPClientConfig) -> ClientTransport:
+    def _factory(
+        config: MCPClientConfig, base_headers: Optional[Mapping[str, str]]
+    ) -> ClientTransport:
+        merged_headers = dict(base_headers or {})
+        merged_headers = _merge_headers(base_headers, headers)
         return StreamableHttpTransport(
             url=url,
-            headers=headers,
+            headers=merged_headers or None,
             auth=auth,
             sse_read_timeout=sse_read_timeout,
             httpx_client_factory=httpx_client_factory,
@@ -134,16 +250,20 @@ def build_streamable_http_transport_factory(
 
 def build_sse_transport_factory(
     *,
-    url: str,
-    headers: Optional[dict[str, str]] = None,
+    url: Optional[str] = None,
+    headers: Optional[Mapping[str, str]] = None,
     auth: Any = None,
     sse_read_timeout: Any = None,
     httpx_client_factory: Optional[Callable[[], Any]] = None,
 ) -> TransportFactory:
-    def _factory(_: MCPClientConfig) -> ClientTransport:
+    def _factory(
+        config: MCPClientConfig, base_headers: Optional[Mapping[str, str]]
+    ) -> ClientTransport:
+        resolved_url = url or _build_sse_url(config)
+        merged_headers = _merge_headers(base_headers, headers)
         return SSETransport(
-            url=url,
-            headers=headers,
+            url=resolved_url,
+            headers=merged_headers or None,
             auth=auth,
             sse_read_timeout=sse_read_timeout,
             httpx_client_factory=httpx_client_factory,
@@ -191,28 +311,75 @@ def _format_tool_output(content: Any) -> str:
 
 def _ensure_config(
     *,
+    base_url: str | None = None,
+    host: str | None = None,
+    host_env: str | Sequence[str] = ("MCP_HOST"),
+    port: int | None = None,
+    port_env: str | Sequence[str] | None = ("MCP_PORT"),
+    scheme: str | None = None,
+    scheme_env: str | Sequence[str] | None = ("MCP_SCHEME"),
+    sse_path: str | None = None,
+    sse_path_env: str | Sequence[str] = ("MCP_SSE_PATH"),
+    auth_token_env: str | Sequence[str] | None = ("MCP_AUTH_TOKEN"),
+    connection_retries: int = 5,
+    retry_interval: float = 0.5,
+    headers: Optional[Mapping[str, str]] = None,
+    default_port: int | None = None,
     server_cmd: str | None = None,
-    server_script: str | Path | None,
-    server_args: Sequence[str] | None = None,
-    allow_missing_script: bool = False,
+    server_script: str | Path | None = None,
+    server_args: Optional[Sequence[str]] = None,
 ) -> MCPClientConfig:
-    script_path: Path | None
-    if server_script is None:
-        if not allow_missing_script:
-            raise ValueError("server_script must be provided")
-        script_path = None
-    else:
-        script_path = Path(server_script).resolve()
+    host_env_names = _coerce_env_names(host_env)
+    port_env_names = _coerce_env_names(port_env)
+    scheme_env_names = _coerce_env_names(scheme_env)
+    sse_path_env_names = _coerce_env_names(sse_path_env)
+    auth_token_env_names = _coerce_env_names(auth_token_env)
 
-    if server_cmd is not None:
-        cmd = server_cmd
-    elif script_path is not None:
-        cmd = sys.executable
+    if base_url is not None:
+        normalized_base = base_url.rstrip("/")
     else:
-        cmd = None
-    args_tuple: tuple[str, ...] = tuple(server_args) if server_args else ()
+        resolved_host = host or _first_env_value(host_env_names) or "127.0.0.1"
+        if scheme is None:
+            resolved_scheme = _first_env_value(scheme_env_names) or "http"
+        else:
+            resolved_scheme = scheme
+
+        resolved_port = port
+        if resolved_port is None and port_env_names:
+            port_value = _first_env_value(port_env_names)
+            if port_value:
+                resolved_port = int(port_value)
+        if resolved_port is None:
+            resolved_port = default_port
+
+        if resolved_port is None:
+            normalized_base = f"{resolved_scheme}://{resolved_host}"
+        else:
+            normalized_base = f"{resolved_scheme}://{resolved_host}:{resolved_port}"
+
+    sse_path_value = sse_path or _first_env_value(sse_path_env_names) or "/sse/"
+    normalized_path = _normalize_path(sse_path_value)
+
+    header_items: tuple[tuple[str, str], ...] = ()
+    if headers:
+        header_items = tuple(headers.items())
+
+    script_path: Path | None = None
+    if server_script is not None:
+        script_path = Path(server_script).expanduser().resolve()
+
+    args_tuple: tuple[str, ...] = ()
+    if server_args:
+        args_tuple = tuple(server_args)
+
     return MCPClientConfig(
-        server_cmd=cmd,
+        base_url=normalized_base.rstrip("/"),
+        sse_path=normalized_path,
+        auth_token_env=auth_token_env_names,
+        connection_retries=connection_retries,
+        retry_interval=retry_interval,
+        headers=header_items,
+        server_cmd=server_cmd,
         server_script=script_path,
         server_args=args_tuple,
     )
@@ -224,16 +391,34 @@ class MCPToolkit:
     def __init__(
         self,
         *,
-        server_cmd: str | None = None,
-        server_script: str | Path | None = None,
-        server_args: Sequence[str] | None = None,
+        base_url: str | None = None,
+        host: str | None = None,
+        host_env: str | Sequence[str] = ("MCP_HOST"),
+        port: int | None = None,
+        port_env: str | Sequence[str] | None = ("MCP_PORT"),
+        scheme: str | None = None,
+        scheme_env: str | Sequence[str] | None = ("MCP_SCHEME"),
+        sse_path: str | None = None,
+        sse_path_env: str | Sequence[str] = ("MCP_SSE_PATH"),
+        auth_token_env: str | Sequence[str] | None = ("MCP_AUTH_TOKEN"),
         emit_progress: Optional[
             Callable[[str, float, Optional[float], Optional[str]], None]
         ] = None,
         emit_log: Optional[Callable[[str, str, Any], None]] = None,
         preload: bool = True,
-        transport: ClientTransport | str | Path | dict[str, Any] | None = None,
+        transport: ClientTransport
+        | str
+        | os.PathLike[str]
+        | dict[str, Any]
+        | None = None,
         transport_factory: TransportFactory | None = None,
+        headers: Optional[Mapping[str, str]] = None,
+        connection_retries: int = 5,
+        retry_interval: float = 0.5,
+        default_port: int | None = 8010,
+        server_cmd: str | None = None,
+        server_script: str | Path | None = None,
+        server_args: Optional[Sequence[str]] = None,
     ) -> None:
         if transport is not None and transport_factory is not None:
             raise ValueError("Provide either transport or transport_factory, not both")
@@ -241,17 +426,30 @@ class MCPToolkit:
         if transport is not None:
             transport_factory = _transport_factory_from_spec(transport)
 
-        allow_missing_script = transport_factory is not None
         self.config = _ensure_config(
+            base_url=base_url,
+            host=host,
+            host_env=host_env,
+            port=port,
+            port_env=port_env,
+            scheme=scheme,
+            scheme_env=scheme_env,
+            sse_path=sse_path,
+            sse_path_env=sse_path_env,
+            auth_token_env=auth_token_env,
+            connection_retries=connection_retries,
+            retry_interval=retry_interval,
+            headers=headers,
+            default_port=default_port,
             server_cmd=server_cmd,
             server_script=server_script,
             server_args=server_args,
-            allow_missing_script=allow_missing_script,
         )
         self._default_emit_progress = emit_progress or _stdout_emit_progress
         self._default_emit_log = emit_log or _stdout_emit_log
         self._tools_cache: list[FunctionTool] | None = None
-        self._transport_factory = transport_factory or _build_stdio_transport
+        normalized_factory = _normalize_transport_factory(transport_factory)
+        self._transport_factory = normalized_factory
 
         if preload:
             self._tools_cache = self._build_tools_sync()
@@ -284,16 +482,44 @@ class MCPToolkit:
         ] = None,
         log_handler: Optional[Callable[[LogMessage], Any]] = None,
     ) -> Client:
-        transport = self._transport_factory(self.config)
+        headers = self.config.build_headers()
+        transport = self._transport_factory(self.config, headers)
         return Client(
             transport,
             progress_handler=progress_handler,
             log_handler=log_handler,
         )
 
+    @asynccontextmanager
+    async def _client_session(
+        self,
+        *,
+        progress_handler: Optional[
+            Callable[[float, Optional[float], Optional[str]], Any]
+        ] = None,
+        log_handler: Optional[Callable[[LogMessage], Any]] = None,
+    ):
+        last_exc: Exception | None = None
+        for attempt in range(self.config.connection_retries):
+            client = self._create_client(
+                progress_handler=progress_handler,
+                log_handler=log_handler,
+            )
+            try:
+                async with client:
+                    yield client
+                    return
+            except Exception as exc:  # pragma: no cover - transient connection errors
+                last_exc = exc
+                if attempt == self.config.connection_retries - 1:
+                    break
+                await asyncio.sleep(self.config.retry_interval)
+        raise RuntimeError(
+            f"Unable to connect to {_describe_connection(self.config)}"
+        ) from last_exc
+
     async def _list_tool_specs(self) -> list[MCPToolSpec]:
-        client = self._create_client()
-        async with client:
+        async with self._client_session() as client:
             tools = await client.list_tools()
 
         specs: list[MCPToolSpec] = []
@@ -333,12 +559,10 @@ class MCPToolkit:
                 if emit_log:
                     emit_log(spec.name, message.level, message.data)
 
-            client = self._create_client(
+            async with self._client_session(
                 progress_handler=progress_handler,
                 log_handler=log_handler,
-            )
-
-            async with client:
+            ) as client:
                 result = await client.call_tool(spec.name, arguments)
             return _format_tool_output(result)
 
@@ -392,27 +616,65 @@ class MCPToolkit:
 
 def get_mcp_function_tools(
     *,
-    server_cmd: str | None = None,
-    server_script: str | Path | None = None,
-    server_args: Sequence[str] | None = None,
+    base_url: str | None = None,
+    host: str | None = None,
+    host_env: str | Sequence[str] = ("MCP_HOST"),
+    port: int | None = None,
+    port_env: str | Sequence[str] | None = ("MCP_PORT"),
+    scheme: str | None = None,
+    scheme_env: str | Sequence[str] | None = ("MCP_SCHEME"),
+    sse_path: str | None = None,
+    sse_path_env: str | Sequence[str] = ("MCP_SSE_PATH"),
+    auth_token_env: str | Sequence[str] | None = ("MCP_AUTH_TOKEN"),
     emit_progress_handler: Optional[
         Callable[[str, float, Optional[float], Optional[str]], None]
     ] = None,
     emit_log_handler: Optional[Callable[[str, str, Any], None]] = None,
     preload: bool = True,
-    transport: ClientTransport | str | Path | dict[str, Any] | None = None,
+    transport: ClientTransport
+    | str
+    | os.PathLike[str]
+    | dict[str, Any]
+    | None = None,
     transport_factory: TransportFactory | None = None,
+    headers: Optional[Mapping[str, str]] = None,
+    connection_retries: int = 5,
+    retry_interval: float = 0.5,
+    default_port: int | None = 8010,
+    server_cmd: str | None = None,
+    server_script: str | Path | None = None,
+    server_args: Optional[Sequence[str]] = None,
 ) -> list[FunctionTool]:
     """Convenience helper to build FunctionTool proxies for the given MCP server."""
 
     toolkit = MCPToolkit(
-        server_cmd=server_cmd,
-        server_script=server_script,
-        server_args=server_args,
+        base_url=base_url,
+        host=host,
+        host_env=host_env,
+        port=port,
+        port_env=port_env,
+        scheme=scheme,
+        scheme_env=scheme_env,
+        sse_path=sse_path,
+        sse_path_env=sse_path_env,
+        auth_token_env=auth_token_env,
         emit_progress=emit_progress_handler,
         emit_log=emit_log_handler,
         preload=preload,
         transport=transport,
         transport_factory=transport_factory,
+        headers=headers,
+        connection_retries=connection_retries,
+        retry_interval=retry_interval,
+        default_port=default_port,
+        server_cmd=server_cmd,
+        server_script=server_script,
+        server_args=server_args,
     )
     return toolkit.get_function_tools()
+
+
+def _describe_connection(config: MCPClientConfig) -> str:
+    if config.server_script is not None:
+        return f"FastMCP server via stdio at {config.server_script}"
+    return f"FastMCP server at {_build_sse_url(config)}"
