@@ -1,13 +1,14 @@
 # MCP Tool Helper
 
-MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s tooling ecosystem with OpenAI's Agent Framework. It discovers tools exposed by an MCP server, wraps them as OpenAI `FunctionTools`, and forwards FastMCP progress and log events so agent UIs can show real-time status updates. This fills the gap in the Agent Framework, which does not natively stream tool status back to the client.
+ MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s tooling ecosystem with OpenAI's Agent Framework. It discovers tools exposed by an MCP server, wraps them as OpenAI `FunctionTool`s, and forwards FastMCP progress and log events so agent UIs can show real-time status updates. This fills the gap in the Agent Framework, which does not natively stream tool status back to the client.
 
 ## Features
 
 - Automatically discovers MCP tools and exposes them as OpenAI function tools
 - Streams FastMCP progress and log messages back into your agent runtime
 - Provides optional caching and cache refresh of tool metadata
-- Supports stdio, Streamable HTTP, SSE, and any transport that `fastmcp.infer_transport` understands
+- Defaults to SSE transport and still supports Streamable HTTP or any transport that `fastmcp.infer_transport` understands
+- Supports bearer tokens via environment variables or explicit headers
 - Offers ready-made transport factory helpers for common deployment targets
 
 ## Installation
@@ -16,19 +17,22 @@ MCP Tool Helper bridges [FastMCP](https://github.com/mom1/fastmcp)'s tooling eco
 pip install fastmcp openai
 ```
 
-Clone or copy `mcp_tool_helper.py` into your project.
+Clone or copy `utility/mcp_tool_helper.py` into your project. (A packaged release is planned.)
 
 ## Quick Start
 
 ```python
 from utility.mcp_tool_helper import MCPToolkit, UserContext
 
-# Launch a local MCP server via stdio
-toolkit = MCPToolkit(
-    server_cmd="../FastMCP_Server/.venv/bin/python",
-    server_script="../FastMCP_Server/mcp_tools.py",
-    server_args=("--option",),
-)
+# Option A: connect to an SSE-enabled FastMCP server
+toolkit = MCPToolkit(host="127.0.0.1", port=8010, sse_path="/sse/")
+
+# Option B: launch tools via stdio (Python process)
+# toolkit = MCPToolkit(
+#     server_cmd=".venv/bin/python",
+#     server_script="path/to/mcp_tools.py",
+#     server_args=("--flag",),
+# )
 
 # Discover tools and hand them to an OpenAI agent
 tools = toolkit.get_function_tools()
@@ -71,12 +75,35 @@ context = UserContext(
 
 ## Choosing a Transport
 
-### Stdio (default)
+### Stdio
 
 ```python
 toolkit = MCPToolkit(
-    server_cmd="/path/to/python",
-    server_script="/path/to/mcp_tools.py",
+    server_cmd=".venv/bin/python",
+    server_script="path/to/mcp_tools.py",
+    server_args=("--flag",),
+)
+```
+
+### SSE (default)
+
+```python
+toolkit = MCPToolkit()  # reads MCP_* env vars or falls back to http://127.0.0.1:8010/sse/
+```
+
+Override parts of the connection as needed:
+
+```python
+toolkit = MCPToolkit(
+    base_url="https://mcp.example.com",
+    sse_path="/custom/sse/",
+    auth_token_env="MCP_AUTH_TOKEN",
+)
+
+# Tip: pass headers per request when your app already has the bearer token.
+toolkit = MCPToolkit(
+    base_url="https://mcp.example.com",
+    headers={"Authorization": f"Bearer {token}"},
 )
 ```
 
@@ -93,14 +120,15 @@ toolkit = MCPToolkit(
 )
 ```
 
-### Server-Sent Events (SSE)
+### Custom SSE Transport
 
 ```python
 from utility.mcp_tool_helper import build_sse_transport_factory
 
 toolkit = MCPToolkit(
     transport_factory=build_sse_transport_factory(
-        url="https://mcp.example.com/mcp/sse",
+        url="https://mcp.example.com/mcp/sse/",
+        headers={"X-Custom": "value"},
     ),
 )
 ```
@@ -122,6 +150,42 @@ tools = toolkit.get_function_tools()  # loads on demand
 toolkit.refresh_cache()               # refreshes immediately
 ```
 
+## Authentication
+
+Set `MCP_TEST_TOKEN` (or supply `auth_token_env=`) when you already have a static bearer token.  
+Alternatively provide explicit headers via the `headers=` argument on `MCPToolkit` or `get_mcp_function_tools`, or ensure your custom transport factory attaches whatever auth scheme your deployment expects.
+
+### Practical Environment Variables
+
+- `MCP_HOST` (default `127.0.0.1`; also accepts legacy `MCP_HOST`)
+- `MCP_PORT` (default `8010`; legacy `MCP_PORT`)
+- `MCP_SSE_PATH` (default `/sse/`; legacy `MCP_SSE_PATH`)
+- `MCP_SCHEME` (default `http`; legacy `MCP_SCHEME`)
+- `MCP_AUTH_TOKEN` (bearer token; legacy `MCP_TEST_TOKEN`)
+
+Provide explicit arguments to `MCPToolkit` / `get_mcp_function_tools` to override any of these or to supply stdio settings such as `server_cmd` and `server_script`.
+
+### Typical SSE Deployment Flow
+
+1. Deploy your FastMCP server behind HTTPS and expose its SSE endpoint (e.g., `/sse/`).
+2. Issue time-limited access tokens (e.g., Azure AD) and hand them to clients.
+3. On the client, call `MCPToolkit(base_url="https://...", headers={"Authorization": f"Bearer {token}"})`.
+4. Optionally reuse the same toolkit across requests; call `refresh_cache()` if tools change server-side.
+
+### Local Development (stdio > SSE migration)
+
+1. Start with stdio: `MCPToolkit(server_cmd="python", server_script="local_server.py")`.
+2. Switch to SSE by providing host/port/path without touching call sites:
+
+```python
+toolkit = MCPToolkit(
+    base_url="http://127.0.0.1:8010",
+    sse_path="/sse/",
+)
+```
+
+3. If both stdio and SSE are available, instantiate two toolkits and select based on environment.
+
 ## Convenience Helper
 
 The top-level helper mirrors the constructor and returns a list of `FunctionTool`s in one call.
@@ -130,11 +194,17 @@ The top-level helper mirrors the constructor and returns a list of `FunctionTool
 from utility.mcp_tool_helper import get_mcp_function_tools
 
 tools = get_mcp_function_tools(
-    server_cmd="python",
-    server_script="path/to/mcp_server.py",
-    server_args=("--flag",),
-    transport="https://mcp.example.com/mcp",  # optional
+    host="localhost",
+    port=8010,
+    auth_token_env="MCP_TEST_TOKEN",
+    transport="https://mcp.example.com/mcp",  # optional override
 )
+
+# or via stdio
+# tools = get_mcp_function_tools(
+#     server_cmd=".venv/bin/python",
+#     server_script="path/to/mcp_tools.py",
+# )
 ```
 
 ## Development Notes
